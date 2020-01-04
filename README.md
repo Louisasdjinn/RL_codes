@@ -1,2 +1,3 @@
 # RL_codes
--RL code -Unity 2018.2 of3
+-Reinforcement learning 
+-Server for Unity 2018.2 of3
