@@ -1,210 +1,200 @@
-import argparse
-import os
-import pickle
-import time
-from collections import namedtuple, deque
-from itertools import count
 import math, random
-import gym
 
-import matplotlib.pyplot as plt
+import gym
 import numpy as np
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from tensorboardX import SummaryWriter
+import torch.autograd as autograd 
+import torch.nn.functional as F
+
 from IPython.display import clear_output
+import matplotlib.pyplot as plt
+#%matplotlib inline
 
-#from torch.distributions import Categorical, Normal
-#from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
-
-# Call from source env
-#from mlagents_envs.environment import UnityEnvironment
-#from mlagents_envs.side_channel.engine_configuration_channel import EngineConfig, EngineConfigurationChannel
-
-#Use Cuda
+#Use CUDA
 USE_CUDA = torch.cuda.is_available()
 Variable = lambda *args, **kwargs: autograd.Variable(*args, **kwargs).cuda() if USE_CUDA else autograd.Variable(*args, **kwargs)
 
-# Hyper-parameters
-seed = 1
-num_episodes = 2000
-#Env Parameters
-'''
-env_name = None  # Directly interact with editor
-engine_configuration_channel = EngineConfigurationChannel()
-env = UnityEnvironment(base_port = 5004, file_name=env_name, side_channels = [engine_configuration_channel])
-group_name = env.get_agent_groups()[0]
-group_spec = env.get_agent_group_spec(group_name)
-step_result = env.get_step_result(group_name)
-'''
-num_state = 105
-#num_state = step_result.obs[0][0].shape[0]
-num_action = 7
-#num_action = group_spec.discrete_action_branches[0]
-torch.manual_seed(seed)
-#env.seed(seed)
-
-Transition = namedtuple('Transition', ['state', 'action', 'reward', 'next_state','done'])
-
-class ReplayBuffer(object):
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
+class NaivePrioritizedBuffer(object):
+    def __init__(self, capacity, prob_alpha=0.6):
+        self.prob_alpha = prob_alpha
+        self.capacity   = capacity
+        self.buffer     = []
+        self.pos        = 0
+        self.priorities = np.zeros((capacity,), dtype=np.float32)
     
     def push(self, state, action, reward, next_state, done):
+        assert state.ndim == next_state.ndim
         state      = np.expand_dims(state, 0)
         next_state = np.expand_dims(next_state, 0)
-            
-        self.buffer.append((state, action, reward, next_state, done))
+        
+        max_prio = self.priorities.max() if self.buffer else 1.0
+        
+        if len(self.buffer) < self.capacity:
+            self.buffer.append((state, action, reward, next_state, done))
+        else:
+            self.buffer[self.pos] = (state, action, reward, next_state, done)
+        
+        self.priorities[self.pos] = max_prio
+        self.pos = (self.pos + 1) % self.capacity
     
-    def sample(self, batch_size):
-        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
-        return np.concatenate(state), action, reward, np.concatenate(next_state), done
+    def sample(self, batch_size, beta=0.4):
+        if len(self.buffer) == self.capacity:
+            prios = self.priorities
+        else:
+            prios = self.priorities[:self.pos]
+        
+        probs  = prios ** self.prob_alpha
+        probs /= probs.sum()
+        
+        indices = np.random.choice(len(self.buffer), batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+        
+        total    = len(self.buffer)
+        weights  = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        weights  = np.array(weights, dtype=np.float32)
+        
+        batch       = list(zip(*samples))
+        states      = np.concatenate(batch[0])
+        actions     = batch[1]
+        rewards     = batch[2]
+        next_states = np.concatenate(batch[3])
+        dones       = batch[4]
+        
+        return states, actions, rewards, next_states, dones, indices, weights
     
+    def update_priorities(self, batch_indices, batch_priorities):
+        for idx, prio in zip(batch_indices, batch_priorities):
+            self.priorities[idx] = prio
+
     def __len__(self):
         return len(self.buffer)
 
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        self.fc1 = nn.Linear(num_state, 512)
-        self.fc2 = nn.Linear(512, 512)
-        self.fc3 = nn.Linear(512, 256)
-        self.fc4 = nn.Linear(256, 64)
-        self.fc5 = nn.Linear(64, num_action)
+env_id = "CartPole-v0"
+env = gym.make(env_id)
+epsilon_start = 1.0
+epsilon_final = 0.01
+epsilon_decay = 500
+epsilon_by_frame = lambda frame_idx: epsilon_final + (epsilon_start - epsilon_final) * math.exp(-1. * frame_idx / epsilon_decay)
 
-    def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = F.relu(self.fc4(x))
-        action_value = self.fc5(x)
-        return action_value
-
-class DQN():
-
-    capacity = 1000*600 # start record exp after 100 episodes
-    learning_rate = 1e-3
-    memory_count = 0
-    batch_size = 256
-    gamma = 0.995
-    update_count = 0
-    step = 0
-
-
-    def __init__(self):
+class DQN(nn.Module):
+    def __init__(self, num_inputs, num_actions):
         super(DQN, self).__init__()
-        self.target_net, self.act_net = Net(), Net()
-        self.memory = deque(maxlen = self.capacity)
-        # self.memory = [None]*self.capacity
-        self.optimizer = optim.Adam(self.act_net.parameters(), self.learning_rate)
-        self.loss_func = nn.MSELoss()
-        self.writer = SummaryWriter('./DQN/logs')
-        self.loss_value = 0
-
-
-    def select_action(self,state):
-        state = torch.tensor(state, dtype=torch.float).unsqueeze(0)#1x1x105
-        value = self.act_net(state)#1x1x7
-        #print("value",value)
-        action_max_value, index = torch.max(value, 2)#return the max in each line and its index:torch.max(a,1)
-        #print("index",index)#1x1
-        #print("action_max_value",action_max_value)#1x1
-        action = index.item() # only correspond to the Python number from a single value tensor
-        self.step += 1
-        #print("action",action)
-        if np.random.rand(1) >= 0.9: # epslion greedy
-            action = np.random.choice(range(num_action), 1).item()
+        
+        self.layers = nn.Sequential(
+            nn.Linear(env.observation_space.shape[0], 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, env.action_space.n)
+        )
+        
+    def forward(self, x):
+        return self.layers(x)
+    
+    def act(self, state, epsilon):
+        if random.random() > epsilon:
+            state   = Variable(torch.FloatTensor(state).unsqueeze(0), volatile=True)
+            q_value = self.forward(state)
+            action  = q_value.max(1)[1].data[0].item()
+        else:
+            action = random.randrange(env.action_space.n)
         return action
 
-    def store_transition(self,transition):#TODO transition is called every timestep
-        self.memory.append(transition)
-        #index = self.memory_count % self.capacity
-        #self.memory[index] = transition
-        self.memory_count += 1
-        return self.memory_count >= self.capacity
+current_model = DQN(env.observation_space.shape[0], env.action_space.n)
+target_model  = DQN(env.observation_space.shape[0], env.action_space.n)
+
+if USE_CUDA:
+    current_model = current_model.cuda()
+    target_model  = target_model.cuda()
     
-    def sample(self,batch_size):
-        experience = random.sample(self.memory, batch_size)
-        states = torch.from_numpy(np.vstack([Transition.state for Transition in experience if Transition is not None])).float().view(batch_size,1,-1)
-        actions = torch.from_numpy(np.vstack([Transition.action for Transition in experience if Transition is not None])).long().view(batch_size,-1)
-        rewards = torch.from_numpy(np.vstack([Transition.reward for Transition in experience if Transition is not None])).float().view(batch_size)
-        next_states = torch.from_numpy(np.vstack([Transition.next_state for Transition in experience if Transition is not None])).float().view(batch_size,1,-1)
-        dones = torch.from_numpy(np.vstack([Transition.done for Transition in experience if Transition is not None]).astype(np.uint8)).float().view(batch_size)#set done for cut the relationship between finishment and initiallization   
-        #size of done and reward should be related
-        return states,actions,next_states,rewards,dones
+optimizer = optim.Adam(current_model.parameters())
+
+replay_buffer = NaivePrioritizedBuffer(100000)
+
+def update_target(current_model, target_model):
+    target_model.load_state_dict(current_model.state_dict())
+
+update_target(current_model, target_model)
+
+def compute_td_loss(batch_size, beta):
+    state, action, reward, next_state, done, indices, weights = replay_buffer.sample(batch_size, beta) 
+
+    state      = Variable(torch.FloatTensor(np.float32(state)))
+    next_state = Variable(torch.FloatTensor(np.float32(next_state)))
+    action     = Variable(torch.LongTensor(action))
+    reward     = Variable(torch.FloatTensor(reward))
+    done       = Variable(torch.FloatTensor(done))
+    weights    = Variable(torch.FloatTensor(weights))
+
+    q_values      = current_model(state)
+    next_q_values = target_model(next_state)
+
+    q_value          = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
+    next_q_value     = next_q_values.max(1)[0]
+    expected_q_value = reward + gamma * next_q_value * (1 - done)
     
-    def update(self):
-        if self.memory_count >= self.capacity:
-            state,action,next_state,reward,done = self.sample(self.batch_size)
-            #print("Start updating")
-            #state = torch.tensor([t.state for t in self.memory]).float()#Translate state from 1x1x105 to 100(memory size)x1x105 (Utilize the first dimension of state(unsqueeze))
-            #action = torch.LongTensor([t.action for t in self.memory]).view(-1,1).long()
-            #reward = torch.tensor([t.reward for t in self.memory]).float()
-            #next_state = torch.tensor([t.next_state for t in self.memory]).float()
+    loss  = (q_value - expected_q_value.detach()).pow(2) * weights
+    prios = loss + 1e-5
+    loss  = loss.mean()
+        
+    optimizer.zero_grad()
+    loss.backward()
+    replay_buffer.update_priorities(indices, prios.data.cpu().numpy())
+    optimizer.step()
+    
+    return loss
 
-            #reward = (reward - reward.mean()) / (reward.std() + 1e-7)
-            #Dimension Check
-            #print("reward",reward)
-            #print("shape",reward.shape)
-            #print("targetnet",self.target_net(next_state).max(2)[0])# view all elements
-            #print("shape",self.target_net(next_state))
-            #print("shape",self.target_net(next_state).shape) #100x1x7
-            #print("targetnet",self.target_net(next_state).max(2)[0].squeeze(1))
-            #print("CheckDim",self.target_net(next_state).max(2)[0].squeeze(1).shape == reward.shape)
-            #print("shape",self.act_net(state)) #100x1x7
-            with torch.no_grad():
-                target_v = reward + (1-done) *(self.gamma * self.target_net(next_state).max(2)[0].squeeze(1))# 100
-            #print("target_v",target_v)
-            #print("shape",target_v.shape)
+def plot(frame_idx, rewards, losses):
+    clear_output(True)
+    plt.figure(figsize=(20,5))
+    plt.subplot(131)
+    plt.title('frame %s. reward: %s' % (frame_idx, np.mean(rewards[-10:])))
+    plt.plot(rewards)
+    plt.subplot(132)
+    plt.title('loss')
+    plt.plot(losses)
+    plt.show()
 
-            #Update...
-            '''
-            for index in BatchSampler(SubsetRandomSampler(range(len(self.memory))), batch_size=self.batch_size, drop_last=False):
-                #print("index",index) #1x100
-                #print("action",action)
-                #print("shape",action.shape) #100x1
-                #print("target_v[index].unsqueeze(1)",target_v[index].unsqueeze(1).shape)
-            '''
-            v = (self.act_net(state).squeeze(1).gather(1, action))#Q value #with the dimensions decreased manually
-            loss = self.loss_func(target_v.unsqueeze(1), (self.act_net(state).squeeze(1).gather(1, action)))#Target - Q value of act net
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
 
-            self.loss_value = loss.detach().numpy() # for transfer the value to the API
-            self.writer.add_scalar('loss/value_loss', loss, self.update_count)
-            #print("loss",loss)
-            self.update_count +=1
-            if self.update_count % 100 ==0:
-                self.target_net.load_state_dict(self.act_net.state_dict())
-        else:
-            print("Memory Buff is too less")
-def main():
+beta_start = 0.4
+beta_frames = 1000 
+beta_by_frame = lambda frame_idx: min(1.0, beta_start + frame_idx * (1.0 - beta_start) / beta_frames)
 
-    '''
-    agent = DQN()
-    for i_ep in range(num_episodes):
+num_frames = 100000
+batch_size = 32
+gamma      = 0.99
+
+losses = []
+all_rewards = []
+episode_reward = 0
+
+state = env.reset()
+for frame_idx in range(1, num_frames + 1):
+    epsilon = epsilon_by_frame(frame_idx)
+    action = current_model.act(state, epsilon)
+    
+    next_state, reward, done, _ = env.step(action)
+    replay_buffer.push(state, action, reward, next_state, done)
+    
+    state = next_state
+    episode_reward += reward
+    
+    if done:
         state = env.reset()
-        print("1")
-        if render: env.render()
-        print("2")
-        for t in range(10000):
-            action = agent.select_action(state)
-            next_state, reward, done, info = env.step(action)
-            print("3")
-            if render: env.render()#draw scene for each timestep
-            transition = Transition(state, action, reward, next_state)
-            agent.store_transition(transition)
-            state = next_state
-            if done or t >=9999:
-                agent.writer.add_scalar('live/finish_step', t+1, global_step=i_ep)
-                agent.update()
-                if i_ep % 10 == 0:
-                    print("episodes {}, step is {} ".format(i_ep, t))
-                break
-    '''
-
-if __name__ == '__main__':
-    main()
+        all_rewards.append(episode_reward)
+        episode_reward = 0
+        
+    if len(replay_buffer) > batch_size:
+        beta = beta_by_frame(frame_idx)
+        loss = compute_td_loss(batch_size, beta)
+        losses.append(loss.data.item())
+        
+    if frame_idx % 10000 == 0:
+        plot(frame_idx, all_rewards, losses)
+        
+    if frame_idx % 1000 == 0:
+        update_target(current_model, target_model)
