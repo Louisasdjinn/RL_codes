@@ -24,7 +24,7 @@ class NaivePrioritizedBuffer(object):
         self.buffer     = []
         self.pos        = 0
         self.priorities = np.zeros((capacity,), dtype=np.float32)
-    
+        self.step       = 0
     def push(self, state, action, reward, next_state, done):
         assert state.ndim == next_state.ndim
         state      = np.expand_dims(state, 0)
@@ -39,6 +39,7 @@ class NaivePrioritizedBuffer(object):
         
         self.priorities[self.pos] = max_prio
         self.pos = (self.pos + 1) % self.capacity
+        self.step = self.step+1
     
     def sample(self, batch_size, beta=0.4):
         if len(self.buffer) == self.capacity:
@@ -73,11 +74,15 @@ class NaivePrioritizedBuffer(object):
     def __len__(self):
         return len(self.buffer)
 
-env_id = "CartPole-v0"
-env = gym.make(env_id)
+#env_id = "CartPole-v0"
+#env = gym.make(env_id)
+num_state = 105
+num_action = 7
 epsilon_start = 1.0
 epsilon_final = 0.01
-epsilon_decay = 500
+epsilon_decay = 10000000 #500
+
+
 epsilon_by_frame = lambda frame_idx: epsilon_final + (epsilon_start - epsilon_final) * math.exp(-1. * frame_idx / epsilon_decay)
 
 class DQN(nn.Module):
@@ -85,11 +90,15 @@ class DQN(nn.Module):
         super(DQN, self).__init__()
         
         self.layers = nn.Sequential(
-            nn.Linear(env.observation_space.shape[0], 128),
+            nn.Linear(num_inputs, 512),
             nn.ReLU(),
-            nn.Linear(128, 128),
+            nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Linear(128, env.action_space.n)
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_actions)
         )
         
     def forward(self, x):
@@ -99,13 +108,14 @@ class DQN(nn.Module):
         if random.random() > epsilon:
             state   = Variable(torch.FloatTensor(state).unsqueeze(0), volatile=True)
             q_value = self.forward(state)
-            action  = q_value.max(1)[1].data[0].item()
+            action_max_value, index = torch.max(q_value, 2)
+            action = index.item()
         else:
-            action = random.randrange(env.action_space.n)
+            action = random.randrange(num_action)
         return action
 
-current_model = DQN(env.observation_space.shape[0], env.action_space.n)
-target_model  = DQN(env.observation_space.shape[0], env.action_space.n)
+current_model = DQN(num_state, num_action)
+target_model  = DQN(num_state, num_action)
 
 if USE_CUDA:
     current_model = current_model.cuda()
@@ -121,6 +131,7 @@ def update_target(current_model, target_model):
 update_target(current_model, target_model)
 
 def compute_td_loss(batch_size, beta):
+    gamma = 0.99
     state, action, reward, next_state, done, indices, weights = replay_buffer.sample(batch_size, beta) 
 
     state      = Variable(torch.FloatTensor(np.float32(state)))
@@ -133,8 +144,8 @@ def compute_td_loss(batch_size, beta):
     q_values      = current_model(state)
     next_q_values = target_model(next_state)
 
-    q_value          = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
-    next_q_value     = next_q_values.max(1)[0]
+    q_value          = q_values.squeeze(1).gather(1, action.squeeze(1)).squeeze(1)
+    next_q_value     = next_q_values.max(2)[0].squeeze(1)
     expected_q_value = reward + gamma * next_q_value * (1 - done)
     
     loss  = (q_value - expected_q_value.detach()).pow(2) * weights
@@ -159,7 +170,7 @@ def plot(frame_idx, rewards, losses):
     plt.plot(losses)
     plt.show()
 
-
+'''
 beta_start = 0.4
 beta_frames = 1000 
 beta_by_frame = lambda frame_idx: min(1.0, beta_start + frame_idx * (1.0 - beta_start) / beta_frames)
@@ -198,3 +209,4 @@ for frame_idx in range(1, num_frames + 1):
         
     if frame_idx % 1000 == 0:
         update_target(current_model, target_model)
+'''

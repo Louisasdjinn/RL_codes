@@ -14,7 +14,8 @@ import sys
 
 from mlagents_envs.environment import UnityEnvironment
 from mlagents_envs.side_channel.engine_configuration_channel import EngineConfig, EngineConfigurationChannel
-from DQN import DQN, Transition
+import DQN_Prioritized_EXP as DQN
+#from DQN import DQN, Transition
 
 #env_name = "../envs/GridWorld"  # Name of the Unity environment binary to launch
 env_name = '/home/louis/Desktop/u/push.x86_64'  # Directly interact with editor
@@ -36,7 +37,7 @@ if (sys.version_info[0] < 3):
     raise Exception("ERROR: ML-Agents Toolkit (v0.3 onwards) requires Python 3")
 
 engine_configuration_channel = EngineConfigurationChannel()
-env = UnityEnvironment(base_port = 5004, worker_id = 6,file_name=env_name, side_channels = [engine_configuration_channel])
+env = UnityEnvironment(base_port = 5004, worker_id = 4,file_name=env_name, side_channels = [engine_configuration_channel])
 # 2. Load dependencies
 #Reset the environment
 env.reset()
@@ -85,6 +86,65 @@ def plotdata():
     plt.show()
     #draw the results of data with matplotb
 
+beta_start = 0.4
+beta_frames = 1000 
+beta_by_frame = lambda frame_idx: min(1.0, beta_start + frame_idx * (1.0 - beta_start) / beta_frames)
+
+num_frames = 1000000000
+batch_size = 256
+gamma      = 0.99
+
+losses = []
+all_rewards = []
+episode_reward = 0
+
+env.reset()
+#agent.step = 0#TODO
+step_result = env.get_step_result(group_name)
+done = False
+reward = 0
+state = step_result.obs[0]    
+
+for frame_idx in range(1, num_frames + 1):
+    epsilon = DQN.epsilon_by_frame(frame_idx)
+    action_value = DQN.current_model.act(state, epsilon)
+    action = np.array([[action_value]])
+    #action = action_value[np.newaxis,:]
+    env.step()
+    #print("state1",step_result.obs[0])
+    #print(action)
+    env.set_actions(group_name, action)# step +1 here
+    #print(action)
+    #print("state2",step_result.obs[0])
+    next_state = step_result.obs[0]
+    #print("state3",step_result.obs[0])
+    reward += step_result.reward[0]
+    done = step_result.done[0]
+
+    DQN.replay_buffer.push(state, action, reward, next_state, done)
+    
+    state = next_state
+    episode_reward += reward
+    
+    if done or DQN.replay_buffer.step >= 1000:#TODO
+        print(DQN.replay_buffer.step)
+        env.reset()
+        state = step_result.obs[0] 
+        all_rewards.append(episode_reward)
+        episode_reward = 0
+        DQN.replay_buffer.step = 0
+        
+    if len(DQN.replay_buffer) > batch_size:
+        beta = beta_by_frame(frame_idx)
+        loss = DQN.compute_td_loss(batch_size, beta)
+        losses.append(loss.data.item())
+        
+    if frame_idx % 6000000 == 0:
+        DQN.plot(frame_idx, all_rewards, losses)
+        
+    if frame_idx % 1000 == 0:
+        DQN.update_target(DQN.current_model, DQN.target_model)
+'''
 def Iteration():
     loss = []
 
@@ -134,6 +194,7 @@ def Iteration():
                 print("episodes {}, step is {} ".format(i_ep, agent.step))
                 print("Total reward this episode: {}".format(reward))
                 break
+'''
 
 '''
 def RandomAction():
@@ -160,10 +221,6 @@ def RandomAction():
             print("Total reward this episode: {}".format(episode_rewards))
             # 5. Take random actions in the environment
 '''
-def main():
-    Iteration()
-    CloseEnv()
 
 if __name__ == '__main__':
     main()
-
