@@ -123,7 +123,7 @@ if USE_CUDA:
     
 optimizer = optim.Adam(current_model.parameters())
 
-replay_buffer = NaivePrioritizedBuffer(100000)
+replay_buffer = NaivePrioritizedBuffer(600000)
 
 def update_target(current_model, target_model):
     target_model.load_state_dict(current_model.state_dict())
@@ -168,8 +168,8 @@ def plot(frame_idx, rewards, losses):
     plt.subplot(132)
     plt.title('loss')
     plt.plot(losses)
-    plt.show()
-
+    plt.savefig("DQN_Prioritized_%d"%(frame_idx))
+    plt.close()
 '''
 beta_start = 0.4
 beta_frames = 1000 
